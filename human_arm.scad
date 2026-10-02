@@ -19,9 +19,13 @@ elbow_shown = animate ? 55 + 45 * sin(3 * cycle) : elbow;
 
 $fn = 48;
 eps = 0.01;
-clearance = 0.3;   // per side, servo body in its pocket
+// FDM fits. Pockets print undersized and the J2 pocket and the J2/J3 horn pockets print on
+// their side, where the bridged roof sags, so these are looser than the nominal sizes suggest.
+clearance = 0.4;   // per side, servo body in its pocket (clone servos vary by +/-0.2)
 chamfer = 2;       // 45 degree edge chamfer on the organic parts
-horn_clearance = 0.2; // per side, horn in its pocket
+horn_clearance = 0.3; // per side, horn in its pocket
+lead_in = 0.4;     // 45 degree entry chamfer on horn pockets and the wrist socket; the J1 horn
+                   // pocket and the wrist socket open onto the bed, where elephant foot narrows them
 wire_notch_w = 8.5;   // passes a 3-pin Dupont connector
 wire_notch_h = 6;     // wire exit zone above the servo bottom
 
@@ -49,10 +53,10 @@ H_HEAD_D = 19;    // horn screw head counterbore
 H_FLOOR = 20;     // material left under the horn screw head
 
 SG90 = [22.8, 12.2, 22.7, 15.9, 2.5, 32.3, 27.8, 5.9, 11.8, 4.0, 1.8, 7,
-        18, 7.0, 4.0, 1.6, 6.5, 1.8, 2.4, 4.6, 1.0];
+        18, 7.0, 4.0, 1.6, 6.5, 1.8, 2.5, 4.8, 1.0];
 // 3.3 g micro servo: body size given, tabs/shaft/horn estimated -- check against yours.
 MICRO = [16.7, 8.2, 17, 12.5, 1.2, 23.5, 20.5, 4.1, 7.5, 2.0, 1.3, 5,
-         12, 5.0, 3.0, 1.2, 4.5, 1.4, 1.8, 3.4, 0.8];
+         12, 5.0, 3.0, 1.2, 4.5, 1.4, 2.0, 3.6, 0.8];
 J1 = SG90;
 J2 = MICRO;
 J3 = MICRO;
@@ -87,7 +91,7 @@ pivot_pilot_d = 1.7;     // M2 self-tapping pivot screw
 // --- forearm (yoke around the elbow, J3 horn on the outer cheek) ---
 forearm_len = 48;        // elbow axis to wrist face
 cheek_t = 2.5;
-cheek_gap = 0.3;         // per side, cheek to upper arm
+cheek_gap = 0.4;         // per side, cheek to upper arm
 elbow_clear_r = 10;      // free radius around the elbow inside the yoke
 elbow_max = 115;         // deg, elbow flexion the yoke is carved to allow
 elbow_gap = 1;           // clearance between the upper arm and the carved yoke
@@ -97,19 +101,20 @@ wrist_x = 12;            // wrist block width along X
 wrist_y_range = [-1, 10]; // wrist block along Y, reaching past the back of the hand
 wrist_h = 5;             // wrist block height along Z
 wrist_y = 3;             // hand centre Y in the forearm frame
-pivot_hole_d = 2.3;      // M2 clearance
+pivot_hole_d = 2.5;      // M2 clearance; printed on its side, so it comes out undersized
 
 // --- hand (glued onto a keyed peg in the wrist) ---
 hand_t = 8;              // palm thickness along Y
 peg_size = [5, 5.5, 5];  // X, Y, Z; flush with the back of the hand
-peg_clearance = 0.15;    // per side
+peg_clearance = 0.25;    // per side, room for glue
 palm_w = 19;
 palm_len = 22;
 palm_top = 6;            // wrist face to the top of the palm
 finger_d = 4.2;
 finger_x = [7.2, 2.4, -2.4, -7.2];   // index..little, thumb side is +X
 finger_len = [14, 17, 15.5, 12];
-thumb_d = 4.8;
+thumb_d = 4.8;           // at the root
+thumb_tip_d = 3.65;      // tapers evenly to this at the tip
 thumb_segments = [[9.5, 30], [8, 12]]; // [length, lean toward +X in deg]
 
 // --- skeleton windows: [[a, b], half_a, half_b] diamonds cut straight through a part ---
@@ -224,6 +229,10 @@ module horn_2d(s, extra) {
 // Horn pocket, screw hole and counterbore; mating face at z=0, part body in +Z.
 module horn_socket(s, part_t) {
     translate([0, 0, -eps]) linear_extrude(s[H_POCKET] + eps) horn_2d(s, horn_clearance);
+    hull() {
+        translate([0, 0, -eps]) linear_extrude(eps) horn_2d(s, horn_clearance + lead_in);
+        translate([0, 0, lead_in]) linear_extrude(eps) horn_2d(s, horn_clearance);
+    }
     translate([0, 0, -eps]) cylinder(d = s[H_SCREW_D], h = part_t + 2 * eps);
     translate([0, 0, s[H_POCKET] + s[H_FLOOR]]) cylinder(d = s[H_HEAD_D], h = part_t);
 }
@@ -375,6 +384,11 @@ module forearm() {
                    -forearm_len - eps])
             cube([peg_size[0] + 2 * peg_clearance, peg_size[1] + 2 * peg_clearance,
                   peg_size[2] + 1]);
+        hull() for (g = [0, lead_in])
+            translate([-peg_size[0] / 2 - peg_clearance - lead_in + g,
+                       wrist_y + peg_y0 - peg_clearance - lead_in + g, -forearm_len - eps + g])
+                cube([peg_size[0] + 2 * (peg_clearance + lead_in - g),
+                      peg_size[1] + 2 * (peg_clearance + lead_in - g), eps]);
     }
 }
 
@@ -388,14 +402,44 @@ module finger_rod(len, d) {
     }
 }
 
+// Thin octagonal finger cross-section centred at [x, z], tilted by lean degrees toward +X,
+// its flat face flush with the back of the hand (+Y).
+module finger_section(xz, d, lean) {
+    translate([xz[0], hand_t / 2 - d / 2, xz[1]]) rotate([0, -lean, 0]) rotate([0, 0, 22.5])
+        cylinder(r = d / 2 / cos(22.5), h = eps, center = true, $fn = 8);
+}
+
+// Thumb: one tapered rod bent at the knuckle. Both halves share the knuckle section,
+// which is tilted halfway between them, so the outline runs on without a notch.
+module thumb() {
+    a0 = thumb_segments[0][1];
+    a1 = thumb_segments[1][1];
+    root = [palm_w / 2 - 3, -palm_top];
+    knuckle = root + thumb_segments[0][0] * [sin(a0), -cos(a0)];
+    tip = knuckle + thumb_segments[1][0] * [sin(a1), -cos(a1)];
+    knuckle_d = thumb_d + (thumb_tip_d - thumb_d)
+                * thumb_segments[0][0] / (thumb_segments[0][0] + thumb_segments[1][0]);
+    hull() {
+        finger_section(root, thumb_d, a0);
+        finger_section(knuckle, knuckle_d, (a0 + a1) / 2);
+    }
+    hull() {
+        finger_section(knuckle, knuckle_d, (a0 + a1) / 2);
+        finger_section(tip, thumb_tip_d, a1);
+    }
+}
+
 // Hand: palm, four fingers and a thumb, all flush with the back of the hand (+Y).
 // Frame: wrist face centre at the origin, hand along -Z, palm facing -Y, thumb toward +X.
 module hand() {
     translate([-peg_size[0] / 2, peg_y0, -eps]) cube([peg_size[0], peg_size[1], peg_size[2] + eps]);
     difference() {
-        hull() {
-            chamfer_box([-wrist_x / 2, -hand_t / 2, -palm_top / 2], [wrist_x / 2, hand_t / 2, 0], 1.5);
-            chamfer_box([-palm_w / 2, -hand_t / 2, -palm_len], [palm_w / 2, hand_t / 2, -palm_top]);
+        union() {
+            hull() {
+                chamfer_box([-wrist_x / 2, -hand_t / 2, -palm_top / 2], [wrist_x / 2, hand_t / 2, 0], 1.5);
+                chamfer_box([-palm_w / 2, -hand_t / 2, -palm_len], [palm_w / 2, hand_t / 2, -palm_top]);
+            }
+            thumb(); // inside the difference so its root does not fill the outer palm slot
         }
         for (x = palm_slot_x)
             hull() for (z = palm_slot_z)
@@ -404,13 +448,6 @@ module hand() {
     }
     for (i = [0 : len(finger_x) - 1])
         translate([finger_x[i], finger_center_y, -palm_len + 2]) finger_rod(finger_len[i], finger_d);
-    thumb_y = hand_t / 2 - thumb_d / 2;
-    translate([palm_w / 2 - 3, thumb_y, -palm_top]) {
-        rotate([0, -thumb_segments[0][1], 0]) finger_rod(thumb_segments[0][0] + 1, thumb_d);
-        translate([sin(thumb_segments[0][1]) * thumb_segments[0][0], 0,
-                   -cos(thumb_segments[0][1]) * thumb_segments[0][0]])
-            rotate([0, -thumb_segments[1][1], 0]) finger_rod(thumb_segments[1][0], thumb_d * 0.95);
-    }
 }
 
 // Everything the elbow servo moves, in the forearm frame.
