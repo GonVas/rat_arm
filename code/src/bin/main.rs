@@ -10,15 +10,32 @@
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::AnalogPin;
-use esp_hal::peripherals::{GPIO, Peripherals};
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal::{interrupt, ledc};
+use log::{error, info};
+
+use esp_hal::delay::Delay;
+use esp_hal::main;
+
+// LEDC
+use esp_hal::gpio::DriveMode;
+use esp_hal::ledc::channel::ChannelIFace;
+use esp_hal::ledc::timer::TimerIFace;
+use esp_hal::ledc::{Ledc, LowSpeed, channel, timer};
+use esp_hal::time::Rate;
+
+use embedded_hal::pwm::SetDutyCycle;
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(panic_info: &core::panic::PanicInfo) -> ! {
+    error!("{}", panic_info);
     loop {}
 }
+
+extern crate alloc;
+
+// This creates a default app-descriptor required by the esp-idf bootloader.
+// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
+esp_bootloader_esp_idf::esp_app_desc!();
 
 /*                  Xiao Esp32-c3 Complete Circuit (V0 -> 2 Potentiometer)
 *
@@ -81,41 +98,23 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 * - Read Batt will show the battery percentage on a simple display
 */
 
-extern crate alloc;
-
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
-esp_bootloader_esp_idf::esp_app_desc!();
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
-// #[embassy_executor::task]
-// async fn led_task(gpio_butt: GPIO<'static>) {
-//     loop {
-//
-//
-//         Timer::after_millis(250).await;
-//     }
-// }
-
 struct Servo {
     pub id: u8,
-    pin: GPIO<'static>,
-    channel: ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
+    pin: esp_hal::peripherals::GPIO<'static>,
+    channel: esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
 }
 
 impl Servo {
     pub fn new(
         id: u8,
-        peripherals: &mut Peripherals,
+        peripherals: &mut esp_hal::peripherals::Peripherals,
         servo_pin_numb: u8,
         ledc: &esp_hal::ledc::Ledc,
     ) -> Self {
-        let mut channel0 = ledc.channel(ledc::channel::Number::Channel0, peripherals.GPIO8);
+        let mut channel0 =
+            ledc.channel(esp_hal::ledc::channel::Number::Channel0, peripherals.GPIO8);
         channel0
-            .configure(ledc::channel::config::Config {
+            .configure(esp_hal::ledc::channel::config::Config {
                 timer: &ledc,
                 duty_pct: 10,
                 drive_mode: esp_hal::gpio::DriveMode::PushPull,
@@ -198,7 +197,7 @@ async fn potent_task(
     }
 }
 
-async fn circuitv0(spawner: Spawner, peripherals: Peripherals) -> ! {
+async fn circuitv0(spawner: Spawner, peripherals: esp_hal::peripherals::Peripherals) -> ! {
     // 1 - Configure read button on D9/G9 and turn on LED
     // 2 - ADC on each Potentiometer and turn servo according to values
 
@@ -206,9 +205,7 @@ async fn circuitv0(spawner: Spawner, peripherals: Peripherals) -> ! {
     let led_out_gp = peripherals.GPIO10;
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
     // Set GPIO9 as an output, and set its state high initially.
     let mut led_out = esp_hal::gpio::Output::new(
@@ -244,51 +241,101 @@ async fn circuitv0(spawner: Spawner, peripherals: Peripherals) -> ! {
     // }
 }
 
+#[allow(
+    clippy::large_stack_frames,
+    reason = "it's not unusual to allocate larger buffers etc. in main"
+)]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    // generator version: 1.3.0
-    // generator parameters: --chip esp32c3 -o  -o esp32c3-mini-1 -o unstable-hal -o alloc -o embassy
-
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
-
-    // The following pins are used to bootstrap the chip. They are available
-    // for use, but check the datasheet of the module for more information on them.
-    // - GPIO2
-    // - GPIO8
-    // - GPIO9
-    // These GPIO pins are in use by some feature of the module and should not be used.
-    let _ = peripherals.GPIO11;
-    let _ = peripherals.GPIO12;
-    let _ = peripherals.GPIO13;
-    let _ = peripherals.GPIO14;
-    let _ = peripherals.GPIO15;
-    let _ = peripherals.GPIO16;
-    let _ = peripherals.GPIO17;
-
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 66320);
-
-    circuitv0(spawner, peripherals).await
-
-    // let timg0 = TimerGroup::new(peripherals.TIMG0);
-    // let sw_interrupt =
-    //     esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    // esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    // generator version: 1.4.0
+    // generator parameters: -o esp32c3 -o esp32c3-mini-1 -o unstable-hal -o alloc -o embassy -o log -o neovim-classic
     //
-    // // Set GPIO0 as an output, and set its state high initially.
-    // let mut led = esp_hal::gpio::Output::new(
-    //     peripherals.GPIO10,
-    //     esp_hal::gpio::Level::High,
-    //     esp_hal::gpio::OutputConfig::default(),
-    // );
+    // esp_println::logger::init_logger_from_env();
+    //
+    // let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // let peripherals = esp_hal::init(config);
+    //
+    // // The following pins are used to bootstrap the chip. They are available
+    // // for use, but check the datasheet of the module for more information on them.
+    // // - GPIO2
+    // // - GPIO8
+    // // - GPIO9
+    // // These GPIO pins are in use by some feature of the module and should not be used.
+    // let _gpio11 = peripherals.GPIO11;
+    // let _gpio12 = peripherals.GPIO12;
+    // let _gpio13 = peripherals.GPIO13;
+    // let _gpio14 = peripherals.GPIO14;
+    // let _gpio15 = peripherals.GPIO15;
+    // let _gpio16 = peripherals.GPIO16;
+    // let _gpio17 = peripherals.GPIO17;
+    //
+    // esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 66320);
+    //
+    // let timg0 = TimerGroup::new(peripherals.TIMG0);
+    // esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    //
+    // info!("Embassy initialized!");
     //
     // // TODO: Spawn some tasks
     // let _ = spawner;
     //
     // loop {
+    //     info!("Hello world!");
     //     Timer::after(Duration::from_secs(1)).await;
-    //     led.toggle();
     // }
 
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+
+    let mut servo = peripherals.GPIO8;
+    let ledc = Ledc::new(peripherals.LEDC);
+
+    let mut hstimer0 = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    hstimer0
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty12Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_hz(50),
+        })
+        .unwrap();
+
+    let mut channel0 = ledc.channel(channel::Number::Channel0, servo.reborrow());
+    channel0
+        .configure(channel::config::Config {
+            timer: &hstimer0,
+            duty_pct: 10,
+            drive_mode: DriveMode::PushPull,
+        })
+        .unwrap();
+
+    let delay = Delay::new();
+
+    let max_duty_cycle = channel0.max_duty_cycle() as u32;
+
+    // Minimum duty (2.5%)
+    // For 12bit -> 25 * 4096 /1000 => ~ 102
+    let min_duty = (25 * max_duty_cycle) / 1000;
+    // Maximum duty (12.5%)
+    // For 12bit -> 125 * 4096 /1000 => 512
+    let max_duty = (125 * max_duty_cycle) / 1000;
+    // 512 - 102 => 410
+    let duty_gap = max_duty - min_duty;
+
+    loop {
+        for deg in 0..=180 {
+            let duty = duty_from_angle(deg, min_duty, duty_gap);
+            channel0.set_duty_cycle(duty).unwrap();
+            delay.delay_millis(10);
+        }
+        delay.delay_millis(500);
+
+        for deg in (0..=180).rev() {
+            let duty = duty_from_angle(deg, min_duty, duty_gap);
+            channel0.set_duty_cycle(duty).unwrap();
+            delay.delay_millis(10);
+        }
+        delay.delay_millis(500);
+    }
+
+    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples
 }
