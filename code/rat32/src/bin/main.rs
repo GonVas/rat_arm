@@ -10,14 +10,17 @@
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
+use esp_hal::gpio::AnalogPin;
+use esp_hal::peripherals::{GPIO, Peripherals};
 use esp_hal::timer::timg::TimerGroup;
+use esp_hal::{interrupt, ledc};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-/*                  Xiao Esp32-c3 Complete Circuit (V0 -> 2 Potentioneter)
+/*                  Xiao Esp32-c3 Complete Circuit (V0 -> 2 Potentiometer)
 *
 *                                 Front
 *
@@ -27,16 +30,16 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 *     "               O| D0|A0|G2        VBUS(5V)|O++            *
 *     "               O| D1|A1|G3          GND   |O++          -[ Servo0 ]-
 *  [Pote0]     Pote0--O| D2|A2|G4        3.3V Out|O             [       ]
-*  [V R G]     Pote1--O| D3|A3|G5         D10|G10|O             [G D V]
-*   V D2              O| D4|I2_SDA|G6      D9|G9 |O--LED          D7 V
+*  [V R G]     Pote1--O| D3|A3|G5         D10|G10|O--D10        [G D V]
+*   V D2              O| D4|I2_SDA|G6      D9|G9 |O               D7 V
 *                     O| D5|I2_SDL|G7      D8|G8 |O--Servo1_D
 *     O               O| D6|G21            D7|G7 |O--Servo0_D
 *     "                |                         |
 *     "                | B:[] G9                 |               *
-*  [Pote1]             +--------------------------+            -[ Servo1 ]-
-*  [V R G]                                                      [       ]
+*  [Pote1]             +---|----------------------+            -[ Servo1 ]-
+*  [V R G]    [LED_BUTT]O--+                                    [       ]
 *   V D1                           100ohm       100ohm          [G D V]
-*                              D9--~~~---+   D9-~~~+              D8 V
+*                              D10-~~~---+   D10~~~+              D8 V
 * - Pote0 moves Servo0                  [V G]     [V G]
 * - Pote1 moves Servo1                  [LED0]    [LED1]
 * - D9/Gpio9 turns Leds
@@ -88,6 +91,159 @@ esp_bootloader_esp_idf::esp_app_desc!();
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
+// #[embassy_executor::task]
+// async fn led_task(gpio_butt: GPIO<'static>) {
+//     loop {
+//
+//
+//         Timer::after_millis(250).await;
+//     }
+// }
+
+struct Servo {
+    pub id: u8,
+    pin: GPIO<'static>,
+    channel: ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
+}
+
+impl Servo {
+    pub fn new(
+        id: u8,
+        peripherals: &mut Peripherals,
+        servo_pin_numb: u8,
+        ledc: &esp_hal::ledc::Ledc,
+    ) -> Self {
+        let mut channel0 = ledc.channel(ledc::channel::Number::Channel0, peripherals.GPIO8);
+        channel0
+            .configure(ledc::channel::config::Config {
+                timer: &ledc,
+                duty_pct: 10,
+                drive_mode: esp_hal::gpio::DriveMode::PushPull,
+            })
+            .unwrap();
+
+        let delay = esp_hal::delay::Delay::new();
+
+        let max_duty_cycle = channel0.max_duty_cycle() as u32;
+
+        // Minimum duty (2.5%)
+        // For 12bit -> 25 * 4096 /1000 => ~ 102
+        let min_duty = (25 * max_duty_cycle) / 1000;
+        // Maximum duty (12.5%)
+        // For 12bit -> 125 * 4096 /1000 => 512
+        let max_duty = (125 * max_duty_cycle) / 1000;
+        // 512 - 102 => 410
+        let duty_gap = max_duty - min_duty;
+        todo!()
+    }
+
+    fn set_angle(angle: u8) {
+        todo!()
+    }
+}
+
+struct Arms {
+    left: Servo,
+    right: Servo,
+}
+
+// TODO: change to radian if needed
+fn duty_from_angle(deg: u32, min_duty: u32, duty_gap: u32) -> u16 {
+    let duty = min_duty + ((deg * duty_gap) / 180);
+    duty as u16
+}
+
+#[embassy_executor::task]
+async fn potent_task(
+    poten0_pin: esp_hal::peripherals::GPIO4<'static>,
+    poten1_pin: esp_hal::peripherals::GPIO5<'static>,
+    adc2: esp_hal::peripherals::ADC2<'static>,
+    arms: Arms,
+) {
+    // From https://esp32.implrust.com/core-concepts/adc/adc-in-esp32.html
+    // Attenuation	    Measurable input voltage range
+    // 0   dB	          00  mV ~ 950 mV
+    // 2.5 dB	          100 mV ~ 1250 mV
+    // 6   dB	          150 mV ~ 1750 mV
+    // 11  dB	          150 mV ~ 2450 mV
+
+    let mut adc2_config = esp_hal::analog::adc::AdcConfig::new();
+    let mut poten0 = adc2_config.enable_pin(poten0_pin, esp_hal::analog::adc::Attenuation::_11dB);
+    let mut poten1 = adc2_config.enable_pin(poten1_pin, esp_hal::analog::adc::Attenuation::_6dB);
+    let mut adc2 = esp_hal::analog::adc::Adc::new(adc2, adc2_config);
+
+    esp_println::println!("Starting Potentiometer task, values sent to servos every 75ms");
+
+    loop {
+        let poten0_val: u16 = nb::block!(adc2.read_oneshot(&mut poten0)).unwrap();
+        let poten1_val: u16 = nb::block!(adc2.read_oneshot(&mut poten1)).unwrap();
+
+        let min_angle = 0; // Change to radians if you want
+        let max_angle = 180; // Change to radians if you want
+
+        let servo0_pos = (((poten0_val - min_angle) * (max_angle - min_angle))
+            / (u16::MAX - min_angle))
+            + min_angle;
+        let servo1_pos = (((poten1_val - min_angle) * (max_angle - min_angle))
+            / (u16::MAX - min_angle))
+            + min_angle;
+
+        esp_println::println!(
+            "Poten0:{poten0_val} -> Servo0: {servo0_pos} || Poten1:{poten0_val} -> Servo1: {servo1_pos}",
+        );
+
+        // Send it to servos to do their thing
+
+        Timer::after(Duration::from_millis(75)).await;
+    }
+}
+
+async fn circuitv0(spawner: Spawner, peripherals: Peripherals) -> ! {
+    // 1 - Configure read button on D9/G9 and turn on LED
+    // 2 - ADC on each Potentiometer and turn servo according to values
+
+    let led_button_gp = peripherals.GPIO9;
+    let led_out_gp = peripherals.GPIO10;
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_interrupt =
+        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+
+    // Set GPIO9 as an output, and set its state high initially.
+    let mut led_out = esp_hal::gpio::Output::new(
+        led_out_gp,
+        esp_hal::gpio::Level::High,
+        esp_hal::gpio::OutputConfig::default(),
+    );
+
+    let poten0 = esp_hal::peripherals::GPIO4;
+    let poten1 = esp_hal::peripherals::GPIO5;
+    let adc2_peripheral = peripherals.ADC2;
+    // spawner.spawn(check_joypad(urx, ury, adc2_peripheral)).ok();
+
+    todo!()
+    // spawner.spawn();
+
+    // spawner.spawn(
+    //     async move {
+    //         Timer::after_millis(250).await;
+    //     }
+    //     .await,
+    // );
+
+    // TODO: Spawn some tasks
+    // let _ = spawner;
+    //
+    // loop {
+    //
+    //     spawner.spawn();
+    //
+    //     Timer::after(Duration::from_secs(1)).await;
+    //     led.toggle();
+    // }
+}
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     // generator version: 1.3.0
@@ -112,25 +268,27 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 66320);
 
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    circuitv0(spawner, peripherals).await
 
-    // Set GPIO0 as an output, and set its state high initially.
-    let mut led = esp_hal::gpio::Output::new(
-        peripherals.GPIO10,
-        esp_hal::gpio::Level::High,
-        esp_hal::gpio::OutputConfig::default(),
-    );
-
-    // TODO: Spawn some tasks
-    let _ = spawner;
-
-    loop {
-        Timer::after(Duration::from_secs(1)).await;
-        led.toggle();
-    }
+    // let timg0 = TimerGroup::new(peripherals.TIMG0);
+    // let sw_interrupt =
+    //     esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    // esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    //
+    // // Set GPIO0 as an output, and set its state high initially.
+    // let mut led = esp_hal::gpio::Output::new(
+    //     peripherals.GPIO10,
+    //     esp_hal::gpio::Level::High,
+    //     esp_hal::gpio::OutputConfig::default(),
+    // );
+    //
+    // // TODO: Spawn some tasks
+    // let _ = spawner;
+    //
+    // loop {
+    //     Timer::after(Duration::from_secs(1)).await;
+    //     led.toggle();
+    // }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
 }
