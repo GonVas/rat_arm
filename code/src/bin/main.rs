@@ -7,6 +7,8 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use core::cell::RefCell;
+
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
@@ -17,13 +19,14 @@ use esp_hal::delay::Delay;
 use esp_hal::main;
 
 // LEDC
-use esp_hal::gpio::DriveMode;
+use esp_hal::gpio::{DriveMode, Input, Output};
 use esp_hal::ledc::channel::ChannelIFace;
 use esp_hal::ledc::timer::TimerIFace;
 use esp_hal::ledc::{Ledc, LowSpeed, channel, timer};
 use esp_hal::time::Rate;
 
 use embedded_hal::pwm::SetDutyCycle;
+use mpu6050_dmp::sensor::Mpu6050;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -50,7 +53,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 *  [V R G]     Pote1--O| D3|A3|G5         D10|G10|O--D10        [G D V]
 *   V D2              O| D4|I2_SDA|G6      D9|G9 |O               D7 V
 *                     O| D5|I2_SDL|G7      D8|G8 |O--Servo1_D
-*     O               O| D6|G21            D7|G7 |O--Servo0_D
+*     O               O| D6|G21            D7|G20|O--Servo0_D
 *     "                |                         |
 *     "                | B:[] G9                 |               *
 *  [Pote1]             +---|----------------------+            -[ Servo1 ]-
@@ -75,7 +78,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 *     ^ 3-5V  Sservo3-O| D3|A3|G5         D10|G10|O--Bservo1_D  [G D V]
 *     |          I2C--O| D4|I2_SDA|G6      D9|G9 |O--Bat_Val      D7 B5V
 *     B5V        I2C--O| D5|I2_SDL|G7      D8|G8 |O--Sservo0_D
-*                GyR--O| D6|G21            D7|G7 |O--Sservo1_D
+*                GyR--O| D6|G21            D7|G20|O--Sservo1_D
 *                      |            Bin Bout     |
 *                      | B:[] G9   [B3V] [BO]+   |
 *  [MPU0]      [MPU1]  +-----------|(cera 0.1uf)-|             -[Sservo1]-  Sservo3
@@ -98,67 +101,145 @@ esp_bootloader_esp_idf::esp_app_desc!();
 * - Read Batt will show the battery percentage on a simple display
 */
 
-struct Servo {
-    pub id: u8,
-    pin: esp_hal::peripherals::GPIO<'static>,
-    channel: esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>,
-}
-
-impl Servo {
-    pub fn new(
-        id: u8,
-        peripherals: &mut esp_hal::peripherals::Peripherals,
-        servo_pin_numb: u8,
-        ledc: &esp_hal::ledc::Ledc,
-    ) -> Self {
-        let mut channel0 =
-            ledc.channel(esp_hal::ledc::channel::Number::Channel0, peripherals.GPIO8);
-        channel0
-            .configure(esp_hal::ledc::channel::config::Config {
-                timer: &ledc,
-                duty_pct: 10,
-                drive_mode: esp_hal::gpio::DriveMode::PushPull,
-            })
-            .unwrap();
-
-        let delay = esp_hal::delay::Delay::new();
-
-        let max_duty_cycle = channel0.max_duty_cycle() as u32;
-
-        // Minimum duty (2.5%)
-        // For 12bit -> 25 * 4096 /1000 => ~ 102
-        let min_duty = (25 * max_duty_cycle) / 1000;
-        // Maximum duty (12.5%)
-        // For 12bit -> 125 * 4096 /1000 => 512
-        let max_duty = (125 * max_duty_cycle) / 1000;
-        // 512 - 102 => 410
-        let duty_gap = max_duty - min_duty;
-        todo!()
-    }
-
-    fn set_angle(angle: u8) {
-        todo!()
-    }
-}
-
-struct Arms {
-    left: Servo,
-    right: Servo,
-}
-
 // TODO: change to radian if needed
 fn duty_from_angle(deg: u32, min_duty: u32, duty_gap: u32) -> u16 {
     let duty = min_duty + ((deg * duty_gap) / 180);
     duty as u16
 }
 
-#[embassy_executor::task]
-async fn potent_task(
-    poten0_pin: esp_hal::peripherals::GPIO4<'static>,
-    poten1_pin: esp_hal::peripherals::GPIO5<'static>,
-    adc2: esp_hal::peripherals::ADC2<'static>,
-    arms: Arms,
-) {
+static BUTTON: critical_section::Mutex<RefCell<Option<Input>>> =
+    critical_section::Mutex::new(RefCell::new(None));
+
+static BUTTON_OUT: critical_section::Mutex<RefCell<Option<Output>>> =
+    critical_section::Mutex::new(RefCell::new(None));
+
+// Version 0 --> Potentiometer
+#[allow(
+    clippy::large_stack_frames,
+    reason = "it's not unusual to allocate larger buffers etc. in main"
+)]
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
+    // generator version: 1.4.0
+    // generator parameters: -o esp32c3 -o esp32c3-mini-1 -o unstable-hal -o alloc -o embassy -o log -o neovim-classic
+    //
+    // esp_println::logger::init_logger_from_env();
+    //
+    // let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // let peripherals = esp_hal::init(config);
+
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 66320);
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    info!("Embassy initialized!");
+
+    // I2C handling
+    let i2c_bus = esp_hal::i2c::master::I2c::new(
+        peripherals.I2C0,
+        esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
+    )
+    .unwrap()
+    .with_scl(peripherals.GPIO7)
+    .with_sda(peripherals.GPIO6);
+
+    let mut mpu = Mpu6050::new(i2c_bus, mpu6050_dmp::address::Address::default()).unwrap();
+    let mut delay = embassy_time::Delay;
+    mpu.initialize_dmp(&mut delay).unwrap();
+
+    let i2c_bus = info!("MPU6050-DMP Sensor Initialized");
+
+    // Initialize the Digital Motion Processor (DMP) firmware
+    // The DMP provides enhanced motion processing capabilities and sensor fusion
+    // This step resets the DMP to its default state and loads the firmware
+    // info!("Initializing DMP Firmware");
+    // mpu.initialize_dmp(&mut delay).await.unwrap();
+    // info!("DMP Firmware Initialized");
+
+    // Read raw accelerometer data (uncalibrated)
+    // The accelerometer measures linear acceleration in three axes (X, Y, Z)
+    // Values will be imprecise until calibration is performed
+    // let accel_data = sensor.accel().await.unwrap();
+    // info!(
+    //     "Accelerometer [mg]: x={}, y={}, z={}",
+    //     accel_data.x() as i32,
+    //     accel_data.y() as i32,
+    //     accel_data.z() as i32
+    // );
+
+    // LED interrupt handling -> in GPIO9, out GPIO10
+    let mut io = esp_hal::gpio::Io::new(peripherals.IO_MUX);
+    io.set_interrupt_handler(handler);
+
+    let led = esp_hal::gpio::Output::new(
+        peripherals.GPIO10,
+        esp_hal::gpio::Level::Low,
+        esp_hal::gpio::OutputConfig::default(),
+    );
+
+    let config = esp_hal::gpio::InputConfig::default().with_pull(esp_hal::gpio::Pull::Up);
+    let mut button = esp_hal::gpio::Input::new(peripherals.GPIO9, config);
+
+    critical_section::with(|cs| {
+        button.listen(esp_hal::gpio::Event::FallingEdge);
+        BUTTON_OUT.borrow_ref_mut(cs).replace(led);
+        BUTTON.borrow_ref_mut(cs).replace(button)
+    });
+
+    let mut servo0 = peripherals.GPIO20;
+    let mut servo1 = peripherals.GPIO8;
+    let ledc = Ledc::new(peripherals.LEDC);
+
+    let mut hstimer0 = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    hstimer0
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty12Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_hz(50),
+        })
+        .unwrap();
+
+    let mut channel0 = ledc.channel(channel::Number::Channel0, servo0.reborrow());
+    channel0
+        .configure(channel::config::Config {
+            timer: &hstimer0,
+            duty_pct: 10,
+            drive_mode: DriveMode::PushPull,
+        })
+        .unwrap();
+
+    let mut hstimer1 = ledc.timer::<LowSpeed>(timer::Number::Timer1);
+    hstimer1
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty12Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_hz(50),
+        })
+        .unwrap();
+
+    let mut channel1 = ledc.channel(channel::Number::Channel1, servo1.reborrow());
+    channel1
+        .configure(channel::config::Config {
+            timer: &hstimer1,
+            duty_pct: 10,
+            drive_mode: DriveMode::PushPull,
+        })
+        .unwrap();
+
+    let max_duty_cycle = channel0.max_duty_cycle() as u32;
+
+    // Minimum duty (2.5%)
+    // For 12bit -> 25 * 4096 /1000 => ~ 102
+    let min_duty = (25 * max_duty_cycle) / 1000;
+    // Maximum duty (12.5%)
+    // For 12bit -> 125 * 4096 /1000 => 512
+    let max_duty = (125 * max_duty_cycle) / 1000;
+    // 512 - 102 => 410
+    let duty_gap = max_duty - min_duty;
+
     // From https://esp32.implrust.com/core-concepts/adc/adc-in-esp32.html
     // Attenuation	    Measurable input voltage range
     // 0   dB	          00  mV ~ 950 mV
@@ -167,9 +248,11 @@ async fn potent_task(
     // 11  dB	          150 mV ~ 2450 mV
 
     let mut adc2_config = esp_hal::analog::adc::AdcConfig::new();
-    let mut poten0 = adc2_config.enable_pin(poten0_pin, esp_hal::analog::adc::Attenuation::_11dB);
-    let mut poten1 = adc2_config.enable_pin(poten1_pin, esp_hal::analog::adc::Attenuation::_6dB);
-    let mut adc2 = esp_hal::analog::adc::Adc::new(adc2, adc2_config);
+    let mut poten0 =
+        adc2_config.enable_pin(peripherals.GPIO4, esp_hal::analog::adc::Attenuation::_11dB);
+    let mut poten1 =
+        adc2_config.enable_pin(peripherals.GPIO5, esp_hal::analog::adc::Attenuation::_11dB);
+    let mut adc2 = esp_hal::analog::adc::Adc::new(peripherals.ADC2, adc2_config);
 
     esp_println::println!("Starting Potentiometer task, values sent to servos every 75ms");
 
@@ -192,150 +275,52 @@ async fn potent_task(
         );
 
         // Send it to servos to do their thing
+        channel0
+            .set_duty_cycle(duty_from_angle(servo0_pos as u32, min_duty, duty_gap))
+            .unwrap();
+        channel1
+            .set_duty_cycle(duty_from_angle(servo1_pos as u32, min_duty, duty_gap))
+            .unwrap();
+        Timer::after(Duration::from_millis(50)).await;
 
-        Timer::after(Duration::from_millis(75)).await;
-    }
-}
-
-async fn circuitv0(spawner: Spawner, peripherals: esp_hal::peripherals::Peripherals) -> ! {
-    // 1 - Configure read button on D9/G9 and turn on LED
-    // 2 - ADC on each Potentiometer and turn servo according to values
-
-    let led_button_gp = peripherals.GPIO9;
-    let led_out_gp = peripherals.GPIO10;
-
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
-
-    // Set GPIO9 as an output, and set its state high initially.
-    let mut led_out = esp_hal::gpio::Output::new(
-        led_out_gp,
-        esp_hal::gpio::Level::High,
-        esp_hal::gpio::OutputConfig::default(),
-    );
-
-    let poten0 = esp_hal::peripherals::GPIO4;
-    let poten1 = esp_hal::peripherals::GPIO5;
-    let adc2_peripheral = peripherals.ADC2;
-    // spawner.spawn(check_joypad(urx, ury, adc2_peripheral)).ok();
-
-    todo!()
-    // spawner.spawn();
-
-    // spawner.spawn(
-    //     async move {
-    //         Timer::after_millis(250).await;
-    //     }
-    //     .await,
-    // );
-
-    // TODO: Spawn some tasks
-    // let _ = spawner;
-    //
-    // loop {
-    //
-    //     spawner.spawn();
-    //
-    //     Timer::after(Duration::from_secs(1)).await;
-    //     led.toggle();
-    // }
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
-#[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
-    // generator version: 1.4.0
-    // generator parameters: -o esp32c3 -o esp32c3-mini-1 -o unstable-hal -o alloc -o embassy -o log -o neovim-classic
-    //
-    // esp_println::logger::init_logger_from_env();
-    //
-    // let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    // let peripherals = esp_hal::init(config);
-    //
-    // // The following pins are used to bootstrap the chip. They are available
-    // // for use, but check the datasheet of the module for more information on them.
-    // // - GPIO2
-    // // - GPIO8
-    // // - GPIO9
-    // // These GPIO pins are in use by some feature of the module and should not be used.
-    // let _gpio11 = peripherals.GPIO11;
-    // let _gpio12 = peripherals.GPIO12;
-    // let _gpio13 = peripherals.GPIO13;
-    // let _gpio14 = peripherals.GPIO14;
-    // let _gpio15 = peripherals.GPIO15;
-    // let _gpio16 = peripherals.GPIO16;
-    // let _gpio17 = peripherals.GPIO17;
-    //
-    // esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 66320);
-    //
-    // let timg0 = TimerGroup::new(peripherals.TIMG0);
-    // esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
-    //
-    // info!("Embassy initialized!");
-    //
-    // // TODO: Spawn some tasks
-    // let _ = spawner;
-    //
-    // loop {
-    //     info!("Hello world!");
-    //     Timer::after(Duration::from_secs(1)).await;
-    // }
-
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
-
-    let mut servo = peripherals.GPIO8;
-    let ledc = Ledc::new(peripherals.LEDC);
-
-    let mut hstimer0 = ledc.timer::<LowSpeed>(timer::Number::Timer0);
-    hstimer0
-        .configure(timer::config::Config {
-            duty: timer::config::Duty::Duty12Bit,
-            clock_source: timer::LSClockSource::APBClk,
-            frequency: Rate::from_hz(50),
-        })
-        .unwrap();
-
-    let mut channel0 = ledc.channel(channel::Number::Channel0, servo.reborrow());
-    channel0
-        .configure(channel::config::Config {
-            timer: &hstimer0,
-            duty_pct: 10,
-            drive_mode: DriveMode::PushPull,
-        })
-        .unwrap();
-
-    let delay = Delay::new();
-
-    let max_duty_cycle = channel0.max_duty_cycle() as u32;
-
-    // Minimum duty (2.5%)
-    // For 12bit -> 25 * 4096 /1000 => ~ 102
-    let min_duty = (25 * max_duty_cycle) / 1000;
-    // Maximum duty (12.5%)
-    // For 12bit -> 125 * 4096 /1000 => 512
-    let max_duty = (125 * max_duty_cycle) / 1000;
-    // 512 - 102 => 410
-    let duty_gap = max_duty - min_duty;
-
-    loop {
-        for deg in 0..=180 {
-            let duty = duty_from_angle(deg, min_duty, duty_gap);
-            channel0.set_duty_cycle(duty).unwrap();
-            delay.delay_millis(10);
-        }
-        delay.delay_millis(500);
-
-        for deg in (0..=180).rev() {
-            let duty = duty_from_angle(deg, min_duty, duty_gap);
-            channel0.set_duty_cycle(duty).unwrap();
-            delay.delay_millis(10);
-        }
-        delay.delay_millis(500);
+        Timer::after(Duration::from_millis(250)).await;
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples
+}
+
+#[esp_hal::handler]
+// #[esp_hal::ram]
+fn handler() {
+    esp_println::println!("GPIO Interrupt");
+    if critical_section::with(|cs| {
+        BUTTON
+            .borrow_ref_mut(cs)
+            .as_mut()
+            .unwrap()
+            .is_interrupt_set()
+    }) {
+        esp_println::println!("Button was the source of the interrupt");
+        critical_section::with(|cs| {
+            if let Some(out) = BUTTON_OUT.borrow_ref_mut(cs).as_mut() {
+                esp_println::println!("LED was low setting it to high");
+                if out.is_set_low() {
+                    out.set_high();
+                } else {
+                    esp_println::println!("LED was high setting it to low");
+                    out.set_low();
+                }
+            };
+        });
+    } else {
+        esp_println::println!("Button was not the source of the interrupt");
+    }
+
+    critical_section::with(|cs| {
+        BUTTON
+            .borrow_ref_mut(cs)
+            .as_mut()
+            .unwrap()
+            .clear_interrupt()
+    });
 }
