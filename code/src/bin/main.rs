@@ -377,22 +377,22 @@ async fn main(spawner: Spawner) -> ! {
             info!("Right hand:{hand_right_curr_pos:?}, left hand: {hand_left_curr_pos:?}");
         }
 
-        let servo0_pos = (((poten0_val - min_angle) * (max_angle - min_angle))
-            / (u16::MAX - min_angle))
-            + min_angle;
-        let servo1_pos = (((poten1_val - min_angle) * (max_angle - min_angle))
-            / (u16::MAX - min_angle))
-            + min_angle;
+        // let servo0_pos = (((poten0_val - min_angle) * (max_angle - min_angle))
+        //     / (u16::MAX - min_angle))
+        //     + min_angle;
+        // let servo1_pos = (((poten1_val - min_angle) * (max_angle - min_angle))
+        //     / (u16::MAX - min_angle))
+        //     + min_angle;
 
         // esp_println::println!("Servo0: {servo0_pos} || Servo1: {servo1_pos}",);
 
         // Send it to servos to do their thing
-        channel0
-            .set_duty_cycle(duty_from_angle(servo0_pos as u32, min_duty, duty_gap))
-            .unwrap();
-        channel1
-            .set_duty_cycle(duty_from_angle(servo1_pos as u32, min_duty, duty_gap))
-            .unwrap();
+        // channel0
+        //     .set_duty_cycle(duty_from_angle(servo0_pos as u32, min_duty, duty_gap))
+        //     .unwrap();
+        // channel1
+        //     .set_duty_cycle(duty_from_angle(servo1_pos as u32, min_duty, duty_gap))
+        //     .unwrap();
         Timer::after(Duration::from_millis(100)).await;
     }
 
