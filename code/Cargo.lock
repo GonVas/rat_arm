@@ -1182,31 +1182,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "mpu6050"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abd67852b244bcca82aa14dd89d50795c065fa598e435c0fe2724663f6e3b9f2"
+name = "mpu6050-async"
+version = "0.1.1"
+source = "git+https://codeberg.org/COLORADIO-Project/mpu6050-async?branch=main#437d91d1b82625f0cad9adbf15cc1f9f9c5fcd69"
 dependencies = [
- "embedded-hal 0.2.7",
+ "embedded-hal-async",
  "libm",
  "nalgebra",
 ]
 
 [[package]]
-name = "mpu6050-dmp"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a75c0c24f43578e6cd3f518f35ab9f17fd95124cc1a66e04143b498cd37eec4"
-dependencies = [
- "embedded-hal 1.0.0",
- "libm",
-]
-
-[[package]]
 name = "nalgebra"
-version = "0.31.4"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20bd243ab3dbb395b39ee730402d2e5405e448c75133ec49cc977762c4cba3d1"
+checksum = "adc43a60c217b0c6ff46e47f26911015ad8d2e5a8be1af668c67e370d99a4346"
 dependencies = [
  "approx",
  "num-complex",
@@ -1532,14 +1521,13 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "simba"
-version = "0.7.3"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3fd720c48c53cace224ae62bef1bbff363a70c68c4802a78b5cc6159618176"
+checksum = "f1a7200d82ff1c7b4235efd12f11e2537a402c91cf83a5cb97ce80eef787fde7"
 dependencies = [
  "approx",
  "num-complex",
  "num-traits",
- "paste",
 ]
 
 [[package]]
@@ -1652,7 +1640,9 @@ name = "test-all-c3-features"
 version = "0.1.0"
 dependencies = [
  "critical-section",
+ "embassy-embedded-hal",
  "embassy-executor",
+ "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
@@ -1662,8 +1652,7 @@ dependencies = [
  "esp-println",
  "esp-rtos",
  "log",
- "mpu6050",
- "mpu6050-dmp",
+ "mpu6050-async",
  "nb 1.1.0",
  "static_cell",
 ]

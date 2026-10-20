@@ -8,15 +8,14 @@
 #![deny(clippy::large_stack_frames)]
 
 use core::cell::RefCell;
+use core::mem::MaybeUninit;
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 use log::{error, info};
-
-use esp_hal::delay::Delay;
-use esp_hal::main;
 
 // LEDC
 use esp_hal::gpio::{DriveMode, Input, Output};
@@ -26,7 +25,8 @@ use esp_hal::ledc::{Ledc, LowSpeed, channel, timer};
 use esp_hal::time::Rate;
 
 use embedded_hal::pwm::SetDutyCycle;
-use mpu6050_dmp::sensor::Mpu6050;
+use mpu6050_async::Mpu6050;
+use static_cell::StaticCell;
 
 #[panic_handler]
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
@@ -107,13 +107,72 @@ fn duty_from_angle(deg: u32, min_duty: u32, duty_gap: u32) -> u16 {
     duty as u16
 }
 
-static BUTTON: critical_section::Mutex<RefCell<Option<Input>>> =
+static BUTTON_BATT: critical_section::Mutex<RefCell<Option<Input>>> =
     critical_section::Mutex::new(RefCell::new(None));
 
-static BUTTON_OUT: critical_section::Mutex<RefCell<Option<Output>>> =
+static BUTTON_BATT_OUT: critical_section::Mutex<RefCell<Option<Output>>> =
     critical_section::Mutex::new(RefCell::new(None));
 
-// Version 0 --> Potentiometer
+static BUTTON_GYRO_RESET: critical_section::Mutex<RefCell<Option<Input>>> =
+    critical_section::Mutex::new(RefCell::new(None));
+
+static TO_GYRO_RESET: critical_section::Mutex<RefCell<bool>> =
+    critical_section::Mutex::new(RefCell::new(false));
+
+type I2cBus =
+    embassy_sync::mutex::Mutex<NoopRawMutex, esp_hal::i2c::master::I2c<'static, esp_hal::Async>>;
+type SharedMpu = Mpu6050<
+    embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice<
+        'static,
+        NoopRawMutex,
+        esp_hal::i2c::master::I2c<'static, esp_hal::Async>,
+    >,
+>;
+static I2C_BUS: StaticCell<I2cBus> = StaticCell::new();
+
+fn set_interrupts<'a>(
+    gyro_gpio: impl esp_hal::gpio::InputPin + 'static,
+    batt_gpio: impl esp_hal::gpio::InputPin + 'static,
+) {
+    let mut gyro_reset_button = esp_hal::gpio::Input::new(
+        gyro_gpio,
+        esp_hal::gpio::InputConfig::default().with_pull(esp_hal::gpio::Pull::Up),
+    );
+
+    let mut batt_button = esp_hal::gpio::Input::new(
+        batt_gpio,
+        esp_hal::gpio::InputConfig::default().with_pull(esp_hal::gpio::Pull::Up),
+    );
+
+    critical_section::with(|cs| {
+        batt_button.listen(esp_hal::gpio::Event::FallingEdge);
+        BUTTON_BATT.borrow_ref_mut(cs).replace(batt_button);
+
+        gyro_reset_button.listen(esp_hal::gpio::Event::FallingEdge);
+        BUTTON_GYRO_RESET
+            .borrow_ref_mut(cs)
+            .replace(gyro_reset_button)
+    });
+}
+
+/// Hold the Accelerometer flat with its z pointing up for about 2s
+async fn calibrate_accel(mpu: &mut SharedMpu) -> [f32; 3] {
+    const SAMPLES: usize = 200;
+    let mut sum = [0.0f32; 3];
+
+    for _ in 0..SAMPLES {
+        let a = mpu.get_acc().await.unwrap();
+        sum[0] += a.x;
+        sum[1] += a.y;
+        sum[2] += a.z;
+        Timer::after(Duration::from_millis(10)).await;
+    }
+
+    let n = SAMPLES as f32;
+    [sum[0] / n, sum[1] / n, sum[2] / n - 1.0] // Z should read 1 g, not 0
+}
+
+// Version 1 --> Accs and All servos
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -122,11 +181,7 @@ static BUTTON_OUT: critical_section::Mutex<RefCell<Option<Output>>> =
 async fn main(spawner: Spawner) -> ! {
     // generator version: 1.4.0
     // generator parameters: -o esp32c3 -o esp32c3-mini-1 -o unstable-hal -o alloc -o embassy -o log -o neovim-classic
-    //
-    // esp_println::logger::init_logger_from_env();
-    //
-    // let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    // let peripherals = esp_hal::init(config);
+    esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
@@ -135,63 +190,72 @@ async fn main(spawner: Spawner) -> ! {
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
-    info!("Embassy initialized!");
 
-    // I2C handling
+    let mut io = esp_hal::gpio::Io::new(peripherals.IO_MUX);
+    io.set_interrupt_handler(handler);
+
+    info!("Basic timing and IO init done!");
+
     let i2c_bus = esp_hal::i2c::master::I2c::new(
         peripherals.I2C0,
         esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
     )
     .unwrap()
     .with_scl(peripherals.GPIO7)
-    .with_sda(peripherals.GPIO6);
+    .with_sda(peripherals.GPIO6)
+    .into_async();
 
-    let mut mpu = Mpu6050::new(i2c_bus, mpu6050_dmp::address::Address::default()).unwrap();
-    let mut delay = embassy_time::Delay;
-    mpu.initialize_dmp(&mut delay).unwrap();
+    let i2c_bus: &'static I2cBus = I2C_BUS.init(embassy_sync::mutex::Mutex::new(i2c_bus));
 
-    let i2c_bus = info!("MPU6050-DMP Sensor Initialized");
-
-    // Initialize the Digital Motion Processor (DMP) firmware
-    // The DMP provides enhanced motion processing capabilities and sensor fusion
-    // This step resets the DMP to its default state and loads the firmware
-    // info!("Initializing DMP Firmware");
-    // mpu.initialize_dmp(&mut delay).await.unwrap();
-    // info!("DMP Firmware Initialized");
-
-    // Read raw accelerometer data (uncalibrated)
-    // The accelerometer measures linear acceleration in three axes (X, Y, Z)
-    // Values will be imprecise until calibration is performed
-    // let accel_data = sensor.accel().await.unwrap();
-    // info!(
-    //     "Accelerometer [mg]: x={}, y={}, z={}",
-    //     accel_data.x() as i32,
-    //     accel_data.y() as i32,
-    //     accel_data.z() as i32
-    // );
-
-    // LED interrupt handling -> in GPIO9, out GPIO10
-    let mut io = esp_hal::gpio::Io::new(peripherals.IO_MUX);
-    io.set_interrupt_handler(handler);
-
-    let led = esp_hal::gpio::Output::new(
-        peripherals.GPIO10,
-        esp_hal::gpio::Level::Low,
-        esp_hal::gpio::OutputConfig::default(),
+    let mut acc_mpu_0 = mpu6050_async::Mpu6050::new_with_addr(
+        embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(i2c_bus),
+        mpu6050_async::device::DEFAULT_SLAVE_ADDR,
     );
 
-    let config = esp_hal::gpio::InputConfig::default().with_pull(esp_hal::gpio::Pull::Up);
-    let mut button = esp_hal::gpio::Input::new(peripherals.GPIO9, config);
+    let mut acc_mpu_1 = mpu6050_async::Mpu6050::new_with_addr(
+        embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(i2c_bus),
+        mpu6050_async::device::DEFAULT_SLAVE_ADDR + 1,
+    );
 
-    critical_section::with(|cs| {
-        button.listen(esp_hal::gpio::Event::FallingEdge);
-        BUTTON_OUT.borrow_ref_mut(cs).replace(led);
-        BUTTON.borrow_ref_mut(cs).replace(button)
-    });
+    let mut delay = embassy_time::Delay;
+    acc_mpu_0.init(&mut delay).await.unwrap();
+    acc_mpu_1.init(&mut delay).await.unwrap();
+
+    let acc_0 = acc_mpu_0.get_acc().await.unwrap();
+    info!(
+        "Accelerometer 0 init done! Current x:{:.2}mg, y:{:.2}mg, z:{:.2}mg",
+        acc_0[0], acc_0[1], acc_0[2]
+    );
+
+    let acc_1 = acc_mpu_1.get_acc().await.unwrap();
+    info!(
+        "Accelerometer 1 init done! Current x:{:.2}mg, y:{:.2}mg, z:{:.2}mg",
+        acc_1[0], acc_1[1], acc_1[2]
+    );
+
+    log::warn!("Going to calibrate Accelerometers hold them steady with z axis pointing up for 5s");
+
+    let mut offsets_0 = calibrate_accel(&mut acc_mpu_0).await;
+
+    info!(
+        "Accelerometer 0 calibrated! Current offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
+        offsets_0[0], offsets_0[1], offsets_0[2]
+    );
+
+    let mut offsets_1 = calibrate_accel(&mut acc_mpu_1).await;
+
+    info!(
+        "Accelerometer 1 calibrated! Current offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
+        offsets_1[0], offsets_1[1], offsets_1[2]
+    );
+
+    // GPIO21 -> gyro reset, GPIO02 -> batt level
+    set_interrupts(peripherals.GPIO21, peripherals.GPIO2);
 
     let mut servo0 = peripherals.GPIO20;
     let mut servo1 = peripherals.GPIO8;
-    let ledc = Ledc::new(peripherals.LEDC);
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(esp_hal::ledc::LSGlobalClkSource::APBClk);
 
     let mut hstimer0 = ledc.timer::<LowSpeed>(timer::Number::Timer0);
     hstimer0
@@ -239,29 +303,79 @@ async fn main(spawner: Spawner) -> ! {
     let max_duty = (125 * max_duty_cycle) / 1000;
     // 512 - 102 => 410
     let duty_gap = max_duty - min_duty;
+    let min_angle = 0; // Change to radians if you want
+    let max_angle = 180; // Change to radians if you want
 
-    // From https://esp32.implrust.com/core-concepts/adc/adc-in-esp32.html
-    // Attenuation	    Measurable input voltage range
-    // 0   dB	          00  mV ~ 950 mV
-    // 2.5 dB	          100 mV ~ 1250 mV
-    // 6   dB	          150 mV ~ 1750 mV
-    // 11  dB	          150 mV ~ 2450 mV
+    let mut hand_left_curr_pos = (0.0, 0.0, 0.0);
+    let mut hand_right_curr_pos = (0.0, 0.0, 0.0);
 
-    let mut adc2_config = esp_hal::analog::adc::AdcConfig::new();
-    let mut poten0 =
-        adc2_config.enable_pin(peripherals.GPIO4, esp_hal::analog::adc::Attenuation::_11dB);
-    let mut poten1 =
-        adc2_config.enable_pin(peripherals.GPIO5, esp_hal::analog::adc::Attenuation::_11dB);
-    let mut adc2 = esp_hal::analog::adc::Adc::new(peripherals.ADC2, adc2_config);
+    let mut ticker = embassy_time::Ticker::every(Duration::from_millis(25));
+    let mut last = Instant::now();
 
-    esp_println::println!("Starting Potentiometer task, values sent to servos every 75ms");
+    let mut loop_i = 0u32;
 
     loop {
-        let poten0_val: u16 = nb::block!(adc2.read_oneshot(&mut poten0)).unwrap();
-        let poten1_val: u16 = nb::block!(adc2.read_oneshot(&mut poten1)).unwrap();
+        loop_i += 1;
+        ticker.next().await;
 
-        let min_angle = 0; // Change to radians if you want
-        let max_angle = 180; // Change to radians if you want
+        let to_reset = critical_section::with(|cs| *TO_GYRO_RESET.borrow_ref_mut(cs));
+
+        if to_reset {
+            log::warn!(
+                "Going to calibrate Accelerometers hold them steady with z axis pointing up for 5s"
+            );
+            let mut offsets_0 = calibrate_accel(&mut acc_mpu_0).await;
+            info!(
+                "Acc 0 calibrated! Offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
+                offsets_0[0], offsets_0[1], offsets_0[2]
+            );
+            let mut offsets_1 = calibrate_accel(&mut acc_mpu_1).await;
+            info!(
+                "Acc 1 calibrated! Offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
+                offsets_1[0], offsets_1[1], offsets_1[2]
+            );
+            hand_left_curr_pos = (0.0f32, 0.0f32, 0.0f32);
+            hand_right_curr_pos = (0.0f32, 0.0f32, 0.0f32);
+
+            critical_section::with(|cs| {
+                *TO_GYRO_RESET.borrow_ref_mut(cs) = false;
+            });
+            continue;
+        }
+
+        let acc_0 = acc_mpu_0.get_acc().await.unwrap();
+        let (x0, y0, z0) = (
+            acc_0.x - offsets_0[0],
+            acc_0.y - offsets_0[1],
+            acc_0.z - offsets_0[2],
+        );
+
+        let acc_1 = acc_mpu_1.get_acc().await.unwrap();
+        let (x1, y1, z1) = (
+            acc_1.x - offsets_1[0],
+            acc_1.y - offsets_1[1],
+            acc_1.z - offsets_1[2],
+        );
+
+        let now = Instant::now();
+        let dt_s = (now - last).as_micros() as f32 / 1_000_000.0;
+        last = now;
+
+        hand_right_curr_pos = (
+            hand_right_curr_pos.0 + x0 * dt_s * dt_s,
+            hand_right_curr_pos.1 + y0 * dt_s * dt_s,
+            hand_right_curr_pos.2 + z0 * dt_s * dt_s,
+        );
+
+        hand_left_curr_pos = (
+            hand_left_curr_pos.0 + x1 * dt_s * dt_s,
+            hand_left_curr_pos.1 + y1 * dt_s * dt_s,
+            hand_left_curr_pos.2 + z1 * dt_s * dt_s,
+        );
+
+        if loop_i % 100 == 0 {
+            info!("Right hand:{hand_right_curr_pos:?}, left hand: {hand_left_curr_pos:?}");
+        }
 
         let servo0_pos = (((poten0_val - min_angle) * (max_angle - min_angle))
             / (u16::MAX - min_angle))
@@ -270,9 +384,7 @@ async fn main(spawner: Spawner) -> ! {
             / (u16::MAX - min_angle))
             + min_angle;
 
-        esp_println::println!(
-            "Poten0:{poten0_val} -> Servo0: {servo0_pos} || Poten1:{poten0_val} -> Servo1: {servo1_pos}",
-        );
+        // esp_println::println!("Servo0: {servo0_pos} || Servo1: {servo1_pos}",);
 
         // Send it to servos to do their thing
         channel0
@@ -281,9 +393,7 @@ async fn main(spawner: Spawner) -> ! {
         channel1
             .set_duty_cycle(duty_from_angle(servo1_pos as u32, min_duty, duty_gap))
             .unwrap();
-        Timer::after(Duration::from_millis(50)).await;
-
-        Timer::after(Duration::from_millis(250)).await;
+        Timer::after(Duration::from_millis(100)).await;
     }
 
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples
@@ -294,33 +404,24 @@ async fn main(spawner: Spawner) -> ! {
 fn handler() {
     esp_println::println!("GPIO Interrupt");
     if critical_section::with(|cs| {
-        BUTTON
+        BUTTON_GYRO_RESET
             .borrow_ref_mut(cs)
             .as_mut()
             .unwrap()
             .is_interrupt_set()
     }) {
-        esp_println::println!("Button was the source of the interrupt");
+        esp_println::println!("Gyro Reset was the source of the interrupt");
         critical_section::with(|cs| {
-            if let Some(out) = BUTTON_OUT.borrow_ref_mut(cs).as_mut() {
-                esp_println::println!("LED was low setting it to high");
-                if out.is_set_low() {
-                    out.set_high();
-                } else {
-                    esp_println::println!("LED was high setting it to low");
-                    out.set_low();
-                }
-            };
+            *TO_GYRO_RESET.borrow_ref_mut(cs) = true;
+
+            // If you dont reset then it will just loop the interrupt handler
+            BUTTON_GYRO_RESET
+                .borrow_ref_mut(cs)
+                .as_mut()
+                .unwrap()
+                .clear_interrupt()
         });
     } else {
-        esp_println::println!("Button was not the source of the interrupt");
+        esp_println::println!("Battery Read was the source of the interrupt");
     }
-
-    critical_section::with(|cs| {
-        BUTTON
-            .borrow_ref_mut(cs)
-            .as_mut()
-            .unwrap()
-            .clear_interrupt()
-    });
 }
