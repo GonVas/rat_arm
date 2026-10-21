@@ -1651,6 +1651,7 @@ dependencies = [
  "esp-hal",
  "esp-println",
  "esp-rtos",
+ "libm",
  "log",
  "mpu6050-async",
  "nb 1.1.0",

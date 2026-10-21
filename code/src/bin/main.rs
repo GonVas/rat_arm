@@ -172,6 +172,59 @@ async fn calibrate_accel(mpu: &mut SharedMpu) -> [f32; 3] {
     [sum[0] / n, sum[1] / n, sum[2] / n - 1.0] // Z should read 1 g, not 0
 }
 
+/// Brute forces all possible servo angles to find the closest to the desired positions
+/// the ranges are [min, max, step] all in degrees (max is 256)
+fn angles_from_pos(
+    curr_angles: [u8; 3],
+    target_pos: [u8; 3],
+    servo0_range: [u8; 3],
+    servo1_range: [u8; 3],
+    servo2_range: [u8; 3],
+) -> [u8; 3] {
+    let mut curr_best_pos = None;
+    let mut curr_best_work_diff = None;
+
+    // size in m
+    let l0x = 0.01; // 1cm
+    let l0y = 0.01; // 1cm
+    let l1z = 0.05; // 5cm
+    let l2x = 0.07; // 5cm
+
+    // Changing angles of servo 0 costs a lot power
+    // also servo 1 costs more thant servo 2
+    let servo0_work_mul = 5;
+    let servo1_work_mul = 2;
+
+    for theta0 in (servo0_range[0]..servo0_range[1]).step_by(servo0_range[2] as usize) {
+        for theta1 in (servo1_range[0]..servo1_range[1]).step_by(servo1_range[2] as usize) {
+            for theta2 in (servo2_range[0]..servo2_range[1]).step_by(servo2_range[2] as usize) {
+                let curr_combo_hand_pos_x =
+                    libm::cosf(theta2 as f32) * l2x + l0x * libm::cosf(theta0 as f32);
+                let curr_combo_hand_pos_y = l0y + libm::sinf(theta1 as f32) * l1z;
+                let curr_combo_hand_pos_z = libm::sinf(theta2 as f32) * l2x
+                    + l1z * libm::cosf(theta1 as f32)
+                    + l0x * libm::sinf(theta0 as f32);
+
+                let curr_diff = (theta0 as i16 - curr_angles[0] as i16).abs() * servo0_work_mul
+                    + (theta1 as i16 - curr_angles[1] as i16).abs() * servo1_work_mul
+                    + (theta2 as i16 - curr_angles[2] as i16).abs();
+
+                let Some(curr_best_diff) = curr_best_work_diff else {
+                    curr_best_pos = Some([
+                        curr_combo_hand_pos_x,
+                        curr_combo_hand_pos_y,
+                        curr_combo_hand_pos_z,
+                    ]);
+                    curr_best_work_diff = Some(curr_diff);
+                    continue;
+                };
+            }
+        }
+    }
+
+    todo!()
+}
+
 // Version 1 --> Accs and All servos
 #[allow(
     clippy::large_stack_frames,
