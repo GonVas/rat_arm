@@ -19,9 +19,9 @@ use log::{error, info};
 
 // LEDC
 use esp_hal::gpio::{DriveMode, Input, Output};
-use esp_hal::ledc::channel::ChannelIFace;
+use esp_hal::ledc::channel::{ChannelIFace, Number};
 use esp_hal::ledc::timer::TimerIFace;
-use esp_hal::ledc::{Ledc, LowSpeed, channel, timer};
+use esp_hal::ledc::{self, Ledc, LowSpeed, channel, timer};
 use esp_hal::time::Rate;
 
 use embedded_hal::pwm::SetDutyCycle;
@@ -75,10 +75,10 @@ esp_bootloader_esp_idf::esp_app_desc!();
 *     ^       BatRead-O| D0|A0|G2        VBUS(5V)|O++
 *     ^ Buck  Bservo1-O| D1|A1|G3          GND   |O++          -[Sservo0]-  Sservo2
 *     ^ Conv  Sservo2-O| D2|A2|G4        3.3V Out|O++           [      ]      D2
-*     ^ 3-5V  Sservo3-O| D3|A3|G5         D10|G10|O--Bservo1_D  [G D V]
+*     ^ 3-5V  Sservo3-O| D3|A3|G5         D10|G10|O--Bservo0_D  [G D V]
 *     |          I2C--O| D4|I2_SDA|G6      D9|G9 |O--Bat_Val      D7 B5V
-*     B5V        I2C--O| D5|I2_SDL|G7      D8|G8 |O--Sservo0_D
-*                GyR--O| D6|G21            D7|G20|O--Sservo1_D
+*     B5V        I2C--O| D5|I2_SDL|G7      D8|G8 |O--Sservo1_D
+*                GyR--O| D6|G21            D7|G20|O--Sservo0_D
 *                      |            Bin Bout     |
 *                      | B:[] G9   [B3V] [BO]+   |
 *  [MPU0]      [MPU1]  +-----------|(cera 0.1uf)-|             -[Sservo1]-  Sservo3
@@ -172,17 +172,27 @@ async fn calibrate_accel(mpu: &mut SharedMpu) -> [f32; 3] {
     [sum[0] / n, sum[1] / n, sum[2] / n - 1.0] // Z should read 1 g, not 0
 }
 
+fn cosf_angle(x: f32) -> f32 {
+    libm::cosf(x * 3.141592 / 180.0)
+}
+
+fn sinf_angle(x: f32) -> f32 {
+    libm::sinf(x * 3.141592 / 180.0)
+}
+
 /// Brute forces all possible servo angles to find the closest to the desired positions
 /// the ranges are [min, max, step] all in degrees (max is 256)
 fn angles_from_pos(
     curr_angles: [u8; 3],
-    target_pos: [u8; 3],
+    target_pos: [f32; 3],
     servo0_range: [u8; 3],
     servo1_range: [u8; 3],
     servo2_range: [u8; 3],
 ) -> [u8; 3] {
-    let mut curr_best_pos = None;
-    let mut curr_best_work_diff = None;
+    // let mut best_pos = None;
+    let mut best_angles = None;
+    let mut best_pos_diff = None;
+    let mut best_work_diff = None;
 
     // size in m
     let l0x = 0.01; // 1cm
@@ -195,34 +205,93 @@ fn angles_from_pos(
     let servo0_work_mul = 5;
     let servo1_work_mul = 2;
 
+    // let curr_pos_x =
+    //     cosf_angle(curr_angles[2] as f32) * l2x + l0x * cosf_angle(curr_angles[0] as f32);
+    // let curr_pos_y = l0y + sinf_angle(curr_angles[1] as f32) * l1z;
+    // let curr_pos_z = sinf_angle(curr_angles[2] as f32) * l2x
+    //     + l1z * cosf_angle(curr_angles[1] as f32)
+    //     + l0x * sinf_angle(curr_angles[0] as f32);
+
+    let diff_pos_threshold = 10.0; // If difference is below this amount then they are basically the
+    // same. Basically a deadzone threshold
+
     for theta0 in (servo0_range[0]..servo0_range[1]).step_by(servo0_range[2] as usize) {
         for theta1 in (servo1_range[0]..servo1_range[1]).step_by(servo1_range[2] as usize) {
             for theta2 in (servo2_range[0]..servo2_range[1]).step_by(servo2_range[2] as usize) {
-                let curr_combo_hand_pos_x =
-                    libm::cosf(theta2 as f32) * l2x + l0x * libm::cosf(theta0 as f32);
-                let curr_combo_hand_pos_y = l0y + libm::sinf(theta1 as f32) * l1z;
-                let curr_combo_hand_pos_z = libm::sinf(theta2 as f32) * l2x
-                    + l1z * libm::cosf(theta1 as f32)
-                    + l0x * libm::sinf(theta0 as f32);
+                let combo_x = cosf_angle(theta2 as f32) * l2x + l0x * cosf_angle(theta0 as f32);
+                let combo_y = l0y + sinf_angle(theta1 as f32) * l1z;
+                let combo_z = sinf_angle(theta2 as f32) * l2x
+                    + l1z * cosf_angle(theta1 as f32)
+                    + l0x * sinf_angle(theta0 as f32);
 
-                let curr_diff = (theta0 as i16 - curr_angles[0] as i16).abs() * servo0_work_mul
+                let curr_work = (theta0 as i16 - curr_angles[0] as i16).abs() * servo0_work_mul
                     + (theta1 as i16 - curr_angles[1] as i16).abs() * servo1_work_mul
                     + (theta2 as i16 - curr_angles[2] as i16).abs();
 
-                let Some(curr_best_diff) = curr_best_work_diff else {
-                    curr_best_pos = Some([
-                        curr_combo_hand_pos_x,
-                        curr_combo_hand_pos_y,
-                        curr_combo_hand_pos_z,
-                    ]);
-                    curr_best_work_diff = Some(curr_diff);
+                let combo_to_target_pos_diff = libm::powf(
+                    libm::powf(combo_x - target_pos[0], 2.0)
+                        + libm::powf(combo_y - target_pos[1], 2.0)
+                        + libm::powf(combo_z - target_pos[2], 2.0),
+                    0.5,
+                );
+
+                let (Some(ref mut best_work_diff), Some(ref mut best_pos_diff)) =
+                    (best_work_diff, best_pos_diff)
+                else {
+                    best_angles = Some([theta0, theta1, theta2]);
+                    best_pos_diff = Some(combo_to_target_pos_diff);
+                    best_work_diff = Some(curr_work);
                     continue;
                 };
+
+                // TODO: Pick a point that has less work if within threshold
+                // something like that
+
+                // This new point beats the old one and is cheaper
+                if combo_to_target_pos_diff <= *best_pos_diff {
+                    best_angles = Some([theta0, theta1, theta2]);
+                    *best_pos_diff = combo_to_target_pos_diff;
+                    *best_work_diff = curr_work;
+                }
             }
         }
     }
 
-    todo!()
+    // TODO: fix unwrap
+    best_angles.unwrap()
+}
+
+fn make_servo<'a>(
+    gpio: impl esp_hal::gpio::OutputPin + 'a,
+    timer: &'a ledc::timer::Timer<'a, LowSpeed>,
+    channel_numb: channel::Number,
+    ledc: &mut Ledc<'a>,
+) -> ledc::channel::Channel<'a, LowSpeed> {
+    let mut channel = ledc.channel(channel_numb, gpio);
+    channel
+        .configure(channel::config::Config {
+            timer: timer,
+            duty_pct: 10,
+            drive_mode: DriveMode::PushPull,
+        })
+        .unwrap();
+    channel
+}
+
+fn angle_on_servo<'a>(servo: &mut esp_hal::ledc::channel::Channel<'a, LowSpeed>, angle: u8) {
+    let max_duty_cycle = servo.max_duty_cycle() as u32;
+    // Minimum duty (2.5%)
+    // For 12bit -> 25 * 4096 /1000 => ~ 102
+    let min_duty = (25 * max_duty_cycle) / 1000;
+    // Maximum duty (12.5%)
+    // For 12bit -> 125 * 4096 /1000 => 512
+    let max_duty = (125 * max_duty_cycle) / 1000;
+    // 512 - 102 => 410
+    let duty_gap = max_duty - min_duty;
+
+    servo
+        .set_duty_cycle(duty_from_angle(angle as u32, min_duty, duty_gap))
+        .unwrap();
 }
 
 // Version 1 --> Accs and All servos
@@ -288,14 +357,14 @@ async fn main(spawner: Spawner) -> ! {
 
     log::warn!("Going to calibrate Accelerometers hold them steady with z axis pointing up for 5s");
 
-    let mut offsets_0 = calibrate_accel(&mut acc_mpu_0).await;
+    let offsets_0 = calibrate_accel(&mut acc_mpu_0).await;
 
     info!(
         "Accelerometer 0 calibrated! Current offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
         offsets_0[0], offsets_0[1], offsets_0[2]
     );
 
-    let mut offsets_1 = calibrate_accel(&mut acc_mpu_1).await;
+    let offsets_1 = calibrate_accel(&mut acc_mpu_1).await;
 
     info!(
         "Accelerometer 1 calibrated! Current offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
@@ -305,13 +374,22 @@ async fn main(spawner: Spawner) -> ! {
     // GPIO21 -> gyro reset, GPIO02 -> batt level
     set_interrupts(peripherals.GPIO21, peripherals.GPIO2);
 
-    let mut servo0 = peripherals.GPIO20;
-    let mut servo1 = peripherals.GPIO8;
+    // Right arm -> Bservo0 -> Sservo 0 -> Sservo1
+    let bservo_r_0 = peripherals.GPIO10;
+    let sservo_r_0 = peripherals.GPIO20;
+    let sservo_r_1 = peripherals.GPIO8;
+
+    // Left arm -> Bservo1 -> Sservo 2 -> Sservo3
+    let bservo_l_1 = peripherals.GPIO3;
+    let sservo_l_2 = peripherals.GPIO4;
+    let sservo_l_3 = peripherals.GPIO5;
+
     let mut ledc = Ledc::new(peripherals.LEDC);
     ledc.set_global_slow_clock(esp_hal::ledc::LSGlobalClkSource::APBClk);
 
-    let mut hstimer0 = ledc.timer::<LowSpeed>(timer::Number::Timer0);
-    hstimer0
+    // This timer can be shared by all servos, its fine, servos just take measurments from this
+    let mut servo_timer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+    servo_timer
         .configure(timer::config::Config {
             duty: timer::config::Duty::Duty12Bit,
             clock_source: timer::LSClockSource::APBClk,
@@ -319,50 +397,21 @@ async fn main(spawner: Spawner) -> ! {
         })
         .unwrap();
 
-    let mut channel0 = ledc.channel(channel::Number::Channel0, servo0.reborrow());
-    channel0
-        .configure(channel::config::Config {
-            timer: &hstimer0,
-            duty_pct: 10,
-            drive_mode: DriveMode::PushPull,
-        })
-        .unwrap();
+    let mut bservo_r_0 = make_servo(bservo_r_0, &servo_timer, Number::Channel0, &mut ledc);
+    let mut sservo_r_0 = make_servo(sservo_r_0, &servo_timer, Number::Channel1, &mut ledc);
+    let mut sservo_r_1 = make_servo(sservo_r_1, &servo_timer, Number::Channel2, &mut ledc);
+    let mut bservo_l_1 = make_servo(bservo_l_1, &servo_timer, Number::Channel3, &mut ledc);
+    let mut sservo_l_2 = make_servo(sservo_l_2, &servo_timer, Number::Channel4, &mut ledc);
+    let mut sservo_l_3 = make_servo(sservo_l_3, &servo_timer, Number::Channel5, &mut ledc);
 
-    let mut hstimer1 = ledc.timer::<LowSpeed>(timer::Number::Timer1);
-    hstimer1
-        .configure(timer::config::Config {
-            duty: timer::config::Duty::Duty12Bit,
-            clock_source: timer::LSClockSource::APBClk,
-            frequency: Rate::from_hz(50),
-        })
-        .unwrap();
+    let starting_angles = [0u8, 0u8, 90u8];
 
-    let mut channel1 = ledc.channel(channel::Number::Channel1, servo1.reborrow());
-    channel1
-        .configure(channel::config::Config {
-            timer: &hstimer1,
-            duty_pct: 10,
-            drive_mode: DriveMode::PushPull,
-        })
-        .unwrap();
+    let mut hand_left_curr_pos = [0.0, 0.0, 0.0];
+    let mut hand_left_last_servos = starting_angles.clone(); // elbow 90 degrees
+    let mut hand_right_curr_pos = [0.0, 0.0, 0.0];
+    let mut hand_right_last_servos = starting_angles.clone(); // elbow 90 degrees
 
-    let max_duty_cycle = channel0.max_duty_cycle() as u32;
-
-    // Minimum duty (2.5%)
-    // For 12bit -> 25 * 4096 /1000 => ~ 102
-    let min_duty = (25 * max_duty_cycle) / 1000;
-    // Maximum duty (12.5%)
-    // For 12bit -> 125 * 4096 /1000 => 512
-    let max_duty = (125 * max_duty_cycle) / 1000;
-    // 512 - 102 => 410
-    let duty_gap = max_duty - min_duty;
-    let min_angle = 0; // Change to radians if you want
-    let max_angle = 180; // Change to radians if you want
-
-    let mut hand_left_curr_pos = (0.0, 0.0, 0.0);
-    let mut hand_right_curr_pos = (0.0, 0.0, 0.0);
-
-    let mut ticker = embassy_time::Ticker::every(Duration::from_millis(25));
+    let mut ticker = embassy_time::Ticker::every(Duration::from_millis(125));
     let mut last = Instant::now();
 
     let mut loop_i = 0u32;
@@ -377,18 +426,28 @@ async fn main(spawner: Spawner) -> ! {
             log::warn!(
                 "Going to calibrate Accelerometers hold them steady with z axis pointing up for 5s"
             );
-            let mut offsets_0 = calibrate_accel(&mut acc_mpu_0).await;
+            let offsets_0 = calibrate_accel(&mut acc_mpu_0).await;
             info!(
                 "Acc 0 calibrated! Offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
                 offsets_0[0], offsets_0[1], offsets_0[2]
             );
-            let mut offsets_1 = calibrate_accel(&mut acc_mpu_1).await;
+            let offsets_1 = calibrate_accel(&mut acc_mpu_1).await;
             info!(
                 "Acc 1 calibrated! Offset_x:{:.2}mg, offset_y:{:.2}mg, offset_z:{:.2}mg",
                 offsets_1[0], offsets_1[1], offsets_1[2]
             );
-            hand_left_curr_pos = (0.0f32, 0.0f32, 0.0f32);
-            hand_right_curr_pos = (0.0f32, 0.0f32, 0.0f32);
+            hand_left_curr_pos = [0.0f32, 0.0f32, 0.0f32];
+            hand_right_curr_pos = [0.0f32, 0.0f32, 0.0f32];
+
+            angle_on_servo(&mut bservo_r_0, starting_angles[0]);
+            angle_on_servo(&mut sservo_r_0, starting_angles[1]);
+            angle_on_servo(&mut sservo_r_1, starting_angles[2]);
+            angle_on_servo(&mut bservo_l_1, starting_angles[0]);
+            angle_on_servo(&mut sservo_l_2, starting_angles[1]);
+            angle_on_servo(&mut sservo_l_3, starting_angles[2]);
+
+            hand_right_last_servos = starting_angles;
+            hand_left_last_servos = starting_angles;
 
             critical_section::with(|cs| {
                 *TO_GYRO_RESET.borrow_ref_mut(cs) = false;
@@ -414,41 +473,60 @@ async fn main(spawner: Spawner) -> ! {
         let dt_s = (now - last).as_micros() as f32 / 1_000_000.0;
         last = now;
 
-        hand_right_curr_pos = (
-            hand_right_curr_pos.0 + x0 * dt_s * dt_s,
-            hand_right_curr_pos.1 + y0 * dt_s * dt_s,
-            hand_right_curr_pos.2 + z0 * dt_s * dt_s,
-        );
+        hand_right_curr_pos = [
+            hand_right_curr_pos[0] + x0 * dt_s * dt_s,
+            hand_right_curr_pos[1] + y0 * dt_s * dt_s,
+            hand_right_curr_pos[2] + z0 * dt_s * dt_s,
+        ];
 
-        hand_left_curr_pos = (
-            hand_left_curr_pos.0 + x1 * dt_s * dt_s,
-            hand_left_curr_pos.1 + y1 * dt_s * dt_s,
-            hand_left_curr_pos.2 + z1 * dt_s * dt_s,
-        );
+        hand_left_curr_pos = [
+            hand_left_curr_pos[0] + x1 * dt_s * dt_s,
+            hand_left_curr_pos[1] + y1 * dt_s * dt_s,
+            hand_left_curr_pos[2] + z1 * dt_s * dt_s,
+        ];
 
         if loop_i % 100 == 0 {
             info!("Right hand:{hand_right_curr_pos:?}, left hand: {hand_left_curr_pos:?}");
         }
 
-        // let servo0_pos = (((poten0_val - min_angle) * (max_angle - min_angle))
-        //     / (u16::MAX - min_angle))
-        //     + min_angle;
-        // let servo1_pos = (((poten1_val - min_angle) * (max_angle - min_angle))
-        //     / (u16::MAX - min_angle))
-        //     + min_angle;
+        let elbow = [0u8, 90u8, 5u8];
+        let upper_arm = [0u8, 250u8, 5u8];
+        let shoulder = [0u8, 250u8, 5u8];
 
-        // esp_println::println!("Servo0: {servo0_pos} || Servo1: {servo1_pos}",);
+        let left_hand_new_angles = angles_from_pos(
+            hand_left_last_servos,
+            hand_left_curr_pos,
+            shoulder,
+            upper_arm,
+            elbow,
+        );
 
-        // Send it to servos to do their thing
-        // channel0
-        //     .set_duty_cycle(duty_from_angle(servo0_pos as u32, min_duty, duty_gap))
-        //     .unwrap();
-        // channel1
-        //     .set_duty_cycle(duty_from_angle(servo1_pos as u32, min_duty, duty_gap))
-        //     .unwrap();
-        Timer::after(Duration::from_millis(100)).await;
+        let right_hand_new_angles = angles_from_pos(
+            hand_right_last_servos,
+            hand_right_curr_pos,
+            shoulder,
+            upper_arm,
+            elbow,
+        );
+
+        esp_println::println!(
+            "Right Servos last:{hand_right_last_servos:?} | Right H Pos:{hand_right_curr_pos:?} | Right H New Servos: {right_hand_new_angles:?} | Dt:{dt_s:.3}s | Right H Acc: {acc_0}"
+        );
+
+        esp_println::println!(
+            "Left Servos last:{hand_left_last_servos:?} | Left H Pos:{hand_left_curr_pos:?} | Left H New Servos: {left_hand_new_angles:?} | Dt:{dt_s:.3}s | Left H Acc: {acc_1}"
+        );
+
+        angle_on_servo(&mut bservo_r_0, right_hand_new_angles[0]);
+        angle_on_servo(&mut sservo_r_0, right_hand_new_angles[1]);
+        angle_on_servo(&mut sservo_r_1, right_hand_new_angles[2]);
+        angle_on_servo(&mut bservo_l_1, left_hand_new_angles[0]);
+        angle_on_servo(&mut sservo_l_2, left_hand_new_angles[1]);
+        angle_on_servo(&mut sservo_l_3, left_hand_new_angles[2]);
+
+        hand_right_last_servos = right_hand_new_angles;
+        hand_left_last_servos = left_hand_new_angles;
     }
-
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples
 }
 
