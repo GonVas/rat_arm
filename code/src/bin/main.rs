@@ -26,6 +26,7 @@ use esp_hal::time::Rate;
 
 use embedded_hal::pwm::SetDutyCycle;
 use mpu6050_async::Mpu6050;
+use mpu6050_async::device::{ACCEL_HPF, AccelRange, GyroRange, PWR_MGMT_1};
 use static_cell::StaticCell;
 
 #[panic_handler]
@@ -100,6 +101,16 @@ esp_bootloader_esp_idf::esp_app_desc!();
 * - LED toggle is a toggle button that grounds the LEDs
 * - Read Batt will show the battery percentage on a simple display
 */
+
+/// Same as Mpu6050::init() from mpu6050_async, but without the WHO_AM_I check,
+/// so it works with MPU-6500 / compatible chips.
+async fn init_mpu_no_id_check(mpu: &mut SharedMpu) {
+    mpu.write_byte(PWR_MGMT_1::ADDR, 0x01).await.unwrap(); // wake up, PLL clock
+    Timer::after(Duration::from_millis(100)).await;
+    mpu.set_accel_range(AccelRange::G2).await.unwrap();
+    mpu.set_gyro_range(GyroRange::D250).await.unwrap();
+    mpu.set_accel_hpf(ACCEL_HPF::_RESET).await.unwrap();
+}
 
 // TODO: change to radian if needed
 fn duty_from_angle(deg: u32, min_duty: u32, duty_gap: u32) -> u16 {
@@ -320,7 +331,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let i2c_bus = esp_hal::i2c::master::I2c::new(
         peripherals.I2C0,
-        esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
+        esp_hal::i2c::master::Config::default().with_frequency(Rate::from_khz(100)),
     )
     .unwrap()
     .with_scl(peripherals.GPIO7)
@@ -328,6 +339,17 @@ async fn main(spawner: Spawner) -> ! {
     .into_async();
 
     let i2c_bus: &'static I2cBus = I2C_BUS.init(embassy_sync::mutex::Mutex::new(i2c_bus));
+
+    // {
+    //     let mut bus = i2c_bus.lock().await;
+    //     info!("Scanning I2C bus...");
+    //     for addr in 0x08u8..0x78 {
+    //         let mut who = [0u8; 1];
+    //         if bus.write_read_async(addr, &[0x75], &mut who).await.is_ok() {
+    //             info!("  device at 0x{:02X}, WHO_AM_I = 0x{:02X}", addr, who[0]);
+    //         }
+    //     }
+    // } // lock released here, before the MPUs use the bus
 
     let mut acc_mpu_0 = mpu6050_async::Mpu6050::new_with_addr(
         embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice::new(i2c_bus),
@@ -339,9 +361,10 @@ async fn main(spawner: Spawner) -> ! {
         mpu6050_async::device::DEFAULT_SLAVE_ADDR + 1,
     );
 
-    let mut delay = embassy_time::Delay;
-    acc_mpu_0.init(&mut delay).await.unwrap();
-    acc_mpu_1.init(&mut delay).await.unwrap();
+    init_mpu_no_id_check(&mut acc_mpu_0).await;
+    info!("Acc 0 successfully init");
+    init_mpu_no_id_check(&mut acc_mpu_1).await;
+    info!("Acc 1 successfully init");
 
     let acc_0 = acc_mpu_0.get_acc().await.unwrap();
     info!(
@@ -411,7 +434,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut hand_right_curr_pos = [0.0, 0.0, 0.0];
     let mut hand_right_last_servos = starting_angles.clone(); // elbow 90 degrees
 
-    let mut ticker = embassy_time::Ticker::every(Duration::from_millis(125));
+    let mut ticker = embassy_time::Ticker::every(Duration::from_millis(50));
     let mut last = Instant::now();
 
     let mut loop_i = 0u32;
@@ -439,12 +462,12 @@ async fn main(spawner: Spawner) -> ! {
             hand_left_curr_pos = [0.0f32, 0.0f32, 0.0f32];
             hand_right_curr_pos = [0.0f32, 0.0f32, 0.0f32];
 
-            angle_on_servo(&mut bservo_r_0, starting_angles[0]);
-            angle_on_servo(&mut sservo_r_0, starting_angles[1]);
-            angle_on_servo(&mut sservo_r_1, starting_angles[2]);
-            angle_on_servo(&mut bservo_l_1, starting_angles[0]);
-            angle_on_servo(&mut sservo_l_2, starting_angles[1]);
-            angle_on_servo(&mut sservo_l_3, starting_angles[2]);
+            // angle_on_servo(&mut bservo_r_0, starting_angles[0]);
+            // angle_on_servo(&mut sservo_r_0, starting_angles[1]);
+            // angle_on_servo(&mut sservo_r_1, starting_angles[2]);
+            // angle_on_servo(&mut bservo_l_1, starting_angles[0]);
+            // angle_on_servo(&mut sservo_l_2, starting_angles[1]);
+            // angle_on_servo(&mut sservo_l_3, starting_angles[2]);
 
             hand_right_last_servos = starting_angles;
             hand_left_last_servos = starting_angles;
@@ -489,43 +512,51 @@ async fn main(spawner: Spawner) -> ! {
             info!("Right hand:{hand_right_curr_pos:?}, left hand: {hand_left_curr_pos:?}");
         }
 
-        let elbow = [0u8, 90u8, 5u8];
-        let upper_arm = [0u8, 250u8, 5u8];
-        let shoulder = [0u8, 250u8, 5u8];
+        let elbow = [0u8, 90u8, 10u8];
+        let upper_arm = [0u8, 250u8, 10u8];
+        let shoulder = [0u8, 250u8, 10u8];
 
-        let left_hand_new_angles = angles_from_pos(
-            hand_left_last_servos,
-            hand_left_curr_pos,
-            shoulder,
-            upper_arm,
-            elbow,
-        );
-
-        let right_hand_new_angles = angles_from_pos(
-            hand_right_last_servos,
-            hand_right_curr_pos,
-            shoulder,
-            upper_arm,
-            elbow,
+        esp_println::println!(
+            "Right Servos last:{hand_right_last_servos:?} | Right H Pos:{hand_right_curr_pos:?} | Dt:{dt_s:.3}s | Right H Acc: {acc_0}"
         );
 
         esp_println::println!(
-            "Right Servos last:{hand_right_last_servos:?} | Right H Pos:{hand_right_curr_pos:?} | Right H New Servos: {right_hand_new_angles:?} | Dt:{dt_s:.3}s | Right H Acc: {acc_0}"
+            "Left Servos last:{hand_left_last_servos:?} | Left H Pos:{hand_left_curr_pos:?} | Dt:{dt_s:.3}s | Left H Acc: {acc_1}"
         );
 
-        esp_println::println!(
-            "Left Servos last:{hand_left_last_servos:?} | Left H Pos:{hand_left_curr_pos:?} | Left H New Servos: {left_hand_new_angles:?} | Dt:{dt_s:.3}s | Left H Acc: {acc_1}"
-        );
+        //         let left_hand_new_angles = angles_from_pos(
+        //             hand_left_last_servos,
+        //             hand_left_curr_pos,
+        //             shoulder,
+        //             upper_arm,
+        //             elbow,
+        //         );
+        //
+        //         let right_hand_new_angles = angles_from_pos(
+        //             hand_right_last_servos,
+        //             hand_right_curr_pos,
+        //             shoulder,
+        //             upper_arm,
+        //             elbow,
+        //         );
 
-        angle_on_servo(&mut bservo_r_0, right_hand_new_angles[0]);
-        angle_on_servo(&mut sservo_r_0, right_hand_new_angles[1]);
-        angle_on_servo(&mut sservo_r_1, right_hand_new_angles[2]);
-        angle_on_servo(&mut bservo_l_1, left_hand_new_angles[0]);
-        angle_on_servo(&mut sservo_l_2, left_hand_new_angles[1]);
-        angle_on_servo(&mut sservo_l_3, left_hand_new_angles[2]);
+        //         esp_println::println!(
+        //             "Right Servos last:{hand_right_last_servos:?} | Right H Pos:{hand_right_curr_pos:?} | Right H New Servos: {right_hand_new_angles:?} | Dt:{dt_s:.3}s | Right H Acc: {acc_0}"
+        //         );
+        //
+        //         esp_println::println!(
+        //             "Left Servos last:{hand_left_last_servos:?} | Left H Pos:{hand_left_curr_pos:?} | Left H New Servos: {left_hand_new_angles:?} | Dt:{dt_s:.3}s | Left H Acc: {acc_1}"
+        //         );
 
-        hand_right_last_servos = right_hand_new_angles;
-        hand_left_last_servos = left_hand_new_angles;
+        // angle_on_servo(&mut bservo_r_0, right_hand_new_angles[0]);
+        // angle_on_servo(&mut sservo_r_0, right_hand_new_angles[1]);
+        // angle_on_servo(&mut sservo_r_1, right_hand_new_angles[2]);
+        // angle_on_servo(&mut bservo_l_1, left_hand_new_angles[0]);
+        // angle_on_servo(&mut sservo_l_2, left_hand_new_angles[1]);
+        // angle_on_servo(&mut sservo_l_3, left_hand_new_angles[2]);
+
+        //hand_right_last_servos = right_hand_new_angles;
+        //hand_left_last_servos = left_hand_new_angles;
     }
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples
 }
